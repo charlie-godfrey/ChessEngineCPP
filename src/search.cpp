@@ -12,9 +12,24 @@
 #include <cmath>
 #include <vector>
 namespace {
+constexpr int kMateScore = 32000;
+constexpr int kMaxSearchPly = 64;
+
 inline int eval_for_side(aurora::Position& position) {
   const int raw = aurora::evaluate(position);
   return (position.side_to_move() == aurora::Color::White) ? raw : -raw;
+}
+
+int score_from_tt(int score, int ply) {
+  if (score >= kMateScore - kMaxSearchPly) return score - ply;
+  if (score <= -kMateScore + kMaxSearchPly) return score + ply;
+  return score;
+}
+
+int score_to_tt(int score, int ply) {
+  if (score >= kMateScore - kMaxSearchPly) return score + ply;
+  if (score <= -kMateScore + kMaxSearchPly) return score - ply;
+  return score;
 }
 }  // namespace
 
@@ -52,11 +67,10 @@ void Search::clearKillers() {
   }
 }
 
-void Search::updateHistory(Color color, int from, int to, int depth) {
+void Search::updateHistory(Color color, int from, int to, int bonus) {
   static constexpr int kHistoryMax = 8192;
   int& entry = history_[static_cast<int>(color)][from * 64 + to];
-  entry += depth * depth;
-  if (entry > kHistoryMax) entry = kHistoryMax;
+  entry = std::clamp(entry + bonus, -kHistoryMax, kHistoryMax);
 }
 
 void Search::updateCaptureHistory(Piece piece, Square to, PieceType captured, int depth) {
@@ -208,85 +222,124 @@ bool Search::isEndgame(const Position& position) const {
   return piece_count <= 6;  // Endgame threshold
 }
 
-int Search::quiescence(Position& position, int alpha, int beta, int qdepth) {
+int Search::quiescence(Position& position, int alpha, int beta, int qdepth,
+                       std::vector<ZobristKey>& position_history, int ply) {
   ++nodes_searched_;
   if (stop_search_) {
     return eval_for_side(position);
   }
 
-  // TT probe in qsearch: trust Exact only from main search (depth >= 0).
-  // Qsearch stores at depth -1 with Upper/Lower bounds.
-  constexpr int kQsearchDepth = -1;
   const ZobristKey qkey = position.key();
+  const bool current_is_last = !position_history.empty() &&
+                               position_history.back() == qkey;
+  const std::size_t history_end =
+      position_history.size() - (current_is_last ? 1 : 0);
+  int previous_occurrences = 0;
+  for (std::size_t i = 0; i < history_end; ++i) {
+    if (position_history[i] == qkey) {
+      ++previous_occurrences;
+    }
+  }
+  if (previous_occurrences >= 2) {
+    return contempt_factor_;
+  }
+
+  struct HistoryGuard {
+    std::vector<ZobristKey>& history;
+    bool added;
+    ~HistoryGuard() {
+      if (added) history.pop_back();
+    }
+  };
+  if (!current_is_last) {
+    position_history.push_back(qkey);
+  }
+  HistoryGuard history_guard{position_history, !current_is_last};
+
+  const bool in_check = position.inCheck(position.side_to_move());
+  if (!in_check && position.halfmove_clock() >= 100) {
+    return contempt_factor_;
+  }
+
+  MoveList captures;
+  if (!in_check) {
+    generateCaptures(position, captures);
+    bool has_legal_capture = false;
+    for (std::size_t i = 0; i < captures.size(); ++i) {
+      if (isLegal(position, captures[i])) {
+        has_legal_capture = true;
+        break;
+      }
+    }
+    if (!has_legal_capture) {
+      MoveList legal_moves;
+      generateLegalMoves(position, legal_moves);
+      if (legal_moves.size() == 0) {
+        return contempt_factor_;
+      }
+    }
+  }
+
+  // Qsearch entries are selective and must not be treated as exact.
+  constexpr int kQsearchDepth = -1;
   TTEntry qtt;
-  if (tt_.probe(qkey, qtt)) {
-    if (qtt.bound == BoundType::Exact && qtt.depth >= 0) return qtt.score;
-    if (qtt.bound == BoundType::Lower && qtt.score >= beta) return qtt.score;
-    if (qtt.bound == BoundType::Upper && qtt.score <= alpha) return qtt.score;
+  if (!in_check && tt_.probe(qkey, qtt)) {
+    const int tt_score = score_from_tt(qtt.score, ply);
+    if (qtt.bound == BoundType::Exact && qtt.depth >= 0) return tt_score;
+    if (qtt.bound == BoundType::Lower && tt_score >= beta) return tt_score;
+    if (qtt.bound == BoundType::Upper && tt_score <= alpha) return tt_score;
   }
 
-  const int stand_pat = eval_for_side(position);
-
-  if (stand_pat >= beta) {
-    return stand_pat;
-  }
-
-  if (alpha < stand_pat) {
-    alpha = stand_pat;
-  }
-
-  if (qdepth >= params_.quiescence_max_depth) {
-    return stand_pat;
-  }
-
-  bool in_check = position.inCheck(position.side_to_move());
-  int extension = 0;
-  if (in_check && qdepth < params_.quiescence_max_depth - params_.q_extension_margin) {
-    extension = params_.q_check_extension;
-  }
-
-  // When in check: generate all legal evasions, not just captures
   if (in_check) {
     MoveList evasions;
     generateLegalMoves(position, evasions);
-
     if (evasions.size() == 0) {
-      return -kScoreMate + qdepth;
+      return -kScoreMate + ply;
+    }
+    if (position.halfmove_clock() >= 100) {
+      return contempt_factor_;
     }
 
-    // Score evasions: captures get MVV-LVA bonus, quiets get 0
+    int best_score = -kScoreInfinity;
     std::vector<std::pair<Move, int>> scored_evasions;
     for (std::size_t i = 0; i < evasions.size(); ++i) {
       const Move move = evasions[i];
-      int move_score = 0;
-      if (captured_piece(move) != Piece::None) {
-        move_score = getMvvLvaScore(move) + 1000000;
-      }
+      const int move_score = captured_piece(move) == Piece::None
+                                 ? 0
+                                 : getMvvLvaScore(move) + 1000000;
       scored_evasions.push_back({move, move_score});
     }
     std::sort(scored_evasions.begin(), scored_evasions.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
 
-    int best_score = -kScoreInfinity;
     for (const auto& [move, _] : scored_evasions) {
       Undo undo;
       doMove(position, move, undo);
-      int search_qdepth = qdepth + 1;
-      if (extension > 0) search_qdepth += extension;
-      const int score = -quiescence(position, -beta, -alpha, search_qdepth);
+      const int next_qdepth = qdepth + 1 +
+                              (qdepth < params_.quiescence_max_depth -
+                                           params_.q_extension_margin
+                                   ? params_.q_check_extension
+                                   : 0);
+      const int score = -quiescence(position, -beta, -alpha, next_qdepth,
+                                    position_history, ply + 1);
       undoMove(position, move, undo);
 
-      if (score > best_score) {
-        best_score = score;
-        if (score > alpha) alpha = score;
+      best_score = std::max(best_score, score);
+      alpha = std::max(alpha, score);
+      if (score >= beta) {
+        return score;
       }
-      if (score >= beta) return score;
     }
     return best_score;
   }
 
-  MoveList captures;
-  generateCaptures(position, captures);
+  const int stand_pat = eval_for_side(position);
+  if (stand_pat >= beta) return stand_pat;
+  if (alpha < stand_pat) alpha = stand_pat;
+
+  if (qdepth >= params_.quiescence_max_depth) {
+    return stand_pat;
+  }
 
   std::vector<std::pair<Move, int>> scored_captures;
   static const int PieceValues[] = {100, 320, 330, 500, 900, 20000};
@@ -333,7 +386,8 @@ int Search::quiescence(Position& position, int alpha, int beta, int qdepth) {
       search_qdepth += params_.q_promo_extension;
     }
 
-    const int score = -quiescence(position, -beta, -alpha, search_qdepth);
+    const int score = -quiescence(position, -beta, -alpha, search_qdepth,
+                                  position_history, ply + 1);
     undoMove(position, move, undo);
 
     if (score > best_score) {
@@ -341,13 +395,14 @@ int Search::quiescence(Position& position, int alpha, int beta, int qdepth) {
       if (score > alpha) alpha = score;
     }
     if (score >= beta) {
-      tt_.store(qkey, move, score, 0, BoundType::Lower);
+      tt_.store(qkey, move, score_to_tt(score, ply), kQsearchDepth,
+                BoundType::Lower);
       return score;
     }
   }
 
-  BoundType qbound = (best_score > stand_pat) ? BoundType::Exact : BoundType::Upper;
-  tt_.store(qkey, kNullMove, best_score, 0, qbound);
+  tt_.store(qkey, kNullMove, score_to_tt(best_score, ply), kQsearchDepth,
+            BoundType::Upper);
   return best_score;
 }
 
@@ -367,6 +422,9 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
       return eval_for_side(position);
     }
   }
+  if (ply == 0) {
+    root_best_move_ = kNullMove;
+  }
 
   // Check for threefold repetition
   const ZobristKey current_key = position.key();
@@ -378,6 +436,10 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
   }
   if (repetition_count >= 3) {
     return contempt_factor_;  // Draw by threefold repetition
+  }
+
+  if (ply >= kMaxDepth) {
+    return quiescence(position, alpha, beta, 0, position_history, ply);
   }
   
   // Push current position key to history
@@ -392,8 +454,8 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
   int new_depth = depth + extension - 1;
 
   // Terminal conditions
-  if (new_depth <= 0) {
-    int score = quiescence(position, alpha, beta, 0);
+  if (depth <= 0) {
+    int score = quiescence(position, alpha, beta, 0, position_history, ply);
     position_history.pop_back();  // Pop before returning
     return score;
   }
@@ -408,20 +470,21 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
   if (tt_hit) {
     hash_move = tt_entry.bestMove;
 
-    if (tt_entry.depth >= depth) {
-      int tt_score = tt_entry.score;
-      // Adjust mate scores for current ply
-      if (tt_score >= kScoreMate - kMaxDepth) tt_score -= ply;
-      else if (tt_score <= -kScoreMate + kMaxDepth) tt_score += ply;
+    if (tt_entry.depth >= depth &&
+        position.halfmove_clock() + depth < 100) {
+      const int tt_score = score_from_tt(tt_entry.score, ply);
 
       if (!pv_node) {
         if (tt_entry.bound == BoundType::Exact) {
+          if (ply == 0) root_best_move_ = hash_move;
           position_history.pop_back();
           return tt_score;
         } else if (tt_entry.bound == BoundType::Lower && tt_score >= beta) {
+          if (ply == 0) root_best_move_ = hash_move;
           position_history.pop_back();
           return tt_score;
         } else if (tt_entry.bound == BoundType::Upper && tt_score <= alpha) {
+          if (ply == 0) root_best_move_ = hash_move;
           position_history.pop_back();
           return tt_score;
         }
@@ -432,7 +495,11 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
   if (hash_move == kNullMove && depth >= 6) {
     const int iid_depth = depth - 2;
     if (iid_depth >= 1) {
+      // IID searches this same node; don't count the node itself as a prior
+      // occurrence when checking for repetition inside the reduced search.
+      position_history.pop_back();
       negamax(position, iid_depth, alpha, beta, ply, position_history);
+      position_history.push_back(current_key);
       TTEntry iid_entry;
       if (tt_.probe(key, iid_entry) && iid_entry.bestMove != kNullMove) {
         hash_move = iid_entry.bestMove;
@@ -475,11 +542,13 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
     const int razor_eval = eval_for_side(position);
     if (razor_eval + kRazorMargin[depth] < alpha) {
       if (depth == 1) {
-        const int q_score = quiescence(position, alpha, beta, 0);
+        const int q_score =
+            quiescence(position, alpha, beta, 0, position_history, ply);
         position_history.pop_back();
         return q_score;
       }
-      const int q_score = quiescence(position, alpha, beta, 0);
+      const int q_score =
+          quiescence(position, alpha, beta, 0, position_history, ply);
       if (q_score < alpha) {
         position_history.pop_back();
         return q_score;
@@ -544,9 +613,7 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
   if (hash_move != kNullMove && hash_move_legal && !in_check && depth >= 6 &&
       tt_hit && tt_entry.depth >= depth - 3 &&
       tt_entry.bound != BoundType::Upper) {
-    int tt_score = tt_entry.score;
-    if (tt_score >= kScoreMate - kMaxDepth) tt_score -= ply;
-    else if (tt_score <= -kScoreMate + kMaxDepth) tt_score += ply;
+    const int tt_score = score_from_tt(tt_entry.score, ply);
     const int se_beta = tt_score - params_.singular_margin;
     const int se_depth = (depth - 1) / 2;
     // Search all moves except the hash move at reduced depth
@@ -577,6 +644,7 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
     if (score > best_score) {
       best_score = score;
       best_move = hash_move;
+      if (ply == 0) root_best_move_ = best_move;
     }
 
     if (score >= beta) {
@@ -588,7 +656,7 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
         }
         const int from = square_index(from_square(hash_move));
         const int to = square_index(to_square(hash_move));
-        updateHistory(original_color, from, to, depth);
+        updateHistory(original_color, from, to, depth * depth);
         if (prev_move != kNullMove) {
           const Piece pp = moved_piece(prev_move);
           if (pp != Piece::None)
@@ -597,10 +665,9 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
       } else {
         updateCaptureHistory(moved_piece(hash_move), to_square(hash_move), piece_type_of(hm_cap), depth);
       }
-      int store_score = score;
-      if (store_score >= kScoreMate - kMaxDepth) store_score += ply;
-      else if (store_score <= -kScoreMate + kMaxDepth) store_score -= ply;
+      const int store_score = score_to_tt(score, ply);
       tt_.store(key, hash_move, store_score, depth, BoundType::Lower);
+      if (ply == 0) root_best_move_ = best_move;
       position_history.pop_back();
       return score;
     }
@@ -661,30 +728,6 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
   int move_number = 0;
   bool searched_first_move = false;
 
-  // Multi-Cut Pruning: if multiple moves fail low with shallow search, prune the node
-  if (depth >= 6 && !pv_node && scored_captures.size() >= 4) {
-    int fail_low_count = 0;
-    const int multi_cut_depth = depth - 4;
-    if (multi_cut_depth >= 1) {
-      // Test first 4 moves with shallow search
-      for (int i = 0; i < 4 && i < static_cast<int>(scored_captures.size()); ++i) {
-        const Move test_move = scored_captures[i].first;
-        Undo undo;
-        doMove(position, test_move, undo);
-        const int test_score = -negamax(position, multi_cut_depth, -alpha - 1, -alpha, ply + 1, position_history);
-        undoMove(position, test_move, undo);
-        
-        if (test_score <= alpha) {
-          fail_low_count++;
-        }
-      }
-      if (fail_low_count >= 2) {
-        position_history.pop_back();
-        return alpha;
-      }
-    }
-  }
-
   // 3. Search captures
   for (const auto& [move, _] : scored_captures) {
     move_number++;
@@ -728,15 +771,15 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
     if (score > best_score) {
       best_score = score;
       best_move = move;
+      if (ply == 0) root_best_move_ = best_move;
     }
 
     if (score >= beta) {
       updateCaptureHistory(moved_piece(move), to_square(move),
                            piece_type_of(captured_piece(move)), depth);
-      int store_score = score;
-      if (store_score >= kScoreMate - kMaxDepth) store_score += ply;
-      else if (store_score <= -kScoreMate + kMaxDepth) store_score -= ply;
+      const int store_score = score_to_tt(score, ply);
       tt_.store(key, move, store_score, depth, BoundType::Lower);
+      if (ply == 0) root_best_move_ = best_move;
       position_history.pop_back();
       return score;
     }
@@ -786,6 +829,7 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
     if (score > best_score) {
       best_score = score;
       best_move = killer;
+      if (ply == 0) root_best_move_ = best_move;
     }
 
     if (score >= beta) {
@@ -795,16 +839,15 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
       }
       const int from = square_index(from_square(killer));
       const int to = square_index(to_square(killer));
-      updateHistory(original_color, from, to, depth);
+      updateHistory(original_color, from, to, depth * depth);
       if (prev_move != kNullMove) {
         const Piece pp = moved_piece(prev_move);
         if (pp != Piece::None)
           countermove_[static_cast<int>(pp)][square_index(to_square(prev_move))] = killer;
       }
-      int store_score = score;
-      if (store_score >= kScoreMate - kMaxDepth) store_score += ply;
-      else if (store_score <= -kScoreMate + kMaxDepth) store_score -= ply;
+      const int store_score = score_to_tt(score, ply);
       tt_.store(key, killer, store_score, depth, BoundType::Lower);
+      if (ply == 0) root_best_move_ = best_move;
       position_history.pop_back();
       return score;
     }
@@ -834,8 +877,10 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
       }
     }
 
-    if (new_depth <= 3 && !in_check && !pv_node && captured_piece(move) == Piece::None) {
-      const int futility_margin = params_.futility_margin_per_depth * new_depth;
+    if (move_number > 1 && new_depth <= 3 && !in_check && !pv_node &&
+        captured_piece(move) == Piece::None) {
+      const int futility_margin =
+          params_.futility_margin_per_depth * std::max(1, new_depth);
       if (static_eval + futility_margin < alpha) {
         continue;
       }
@@ -871,6 +916,7 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
       if (reduction > 0) do_reduction = true;
     }
 
+    const int alpha_before_move = alpha;
     int score;
     if (!searched_first_move && pv_node) {
       score = -negamax(position, search_depth, -beta, -alpha, ply + 1, position_history, move);
@@ -889,9 +935,16 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
 
     undoMove(position, move, undo);
 
+    if (score <= alpha_before_move) {
+      const int from = square_index(from_square(move));
+      const int to = square_index(to_square(move));
+      updateHistory(original_color, from, to, -depth * depth);
+    }
+
     if (score > best_score) {
       best_score = score;
       best_move = move;
+      if (ply == 0) root_best_move_ = best_move;
     }
 
     if (score >= beta) {
@@ -902,17 +955,16 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
         }
         const int from = square_index(from_square(move));
         const int to = square_index(to_square(move));
-        updateHistory(original_color, from, to, depth);
+        updateHistory(original_color, from, to, depth * depth);
         if (prev_move != kNullMove) {
           const Piece pp = moved_piece(prev_move);
           if (pp != Piece::None)
             countermove_[static_cast<int>(pp)][square_index(to_square(prev_move))] = move;
         }
       }
-      int store_score = score;
-      if (store_score >= kScoreMate - kMaxDepth) store_score += ply;
-      else if (store_score <= -kScoreMate + kMaxDepth) store_score -= ply;
+      const int store_score = score_to_tt(score, ply);
       tt_.store(key, move, store_score, depth, BoundType::Lower);
+      if (ply == 0) root_best_move_ = best_move;
       position_history.pop_back();
       return score;
     }
@@ -924,14 +976,15 @@ int Search::negamax(Position& position, int depth, int alpha, int beta, int ply,
   }
 
   {
-    int store_score = best_score;
-    if (store_score >= kScoreMate - kMaxDepth) store_score += ply;
-    else if (store_score <= -kScoreMate + kMaxDepth) store_score -= ply;
+    const int store_score = score_to_tt(best_score, ply);
     if (best_move != kNullMove) {
       tt_.store(key, best_move, store_score, depth, bound_type);
     }
   }
 
+  if (ply == 0) {
+    root_best_move_ = best_move;
+  }
   position_history.pop_back();
   return best_score;
 }
@@ -957,6 +1010,9 @@ Move Search::start(Position& position, const SearchLimits& limits) {
   tt_.newSearch();
   nodes_searched_ = 0;
   pv_.clear();
+  last_score_key_ = position.key();
+  last_score_valid_ = false;
+  last_root_move_ = kNullMove;
   max_nodes_ = limits.max_nodes;
   hard_time_ms_ = limits.hard_time_ms;
   soft_time_ms_ = limits.soft_time_ms;
@@ -970,6 +1026,9 @@ Move Search::start(Position& position, const SearchLimits& limits) {
   std::vector<ZobristKey> position_history;
   if (limits.game_history) {
     position_history = *limits.game_history;
+    if (!position_history.empty() && position_history.back() == position.key()) {
+      position_history.pop_back();
+    }
   }
 
   for (int depth = 1; depth <= limits.max_depth; ++depth) {
@@ -1005,18 +1064,18 @@ Move Search::start(Position& position, const SearchLimits& limits) {
     if (stop_search_) {
       break;
     }
+    last_completed_score_ = score;
+    last_score_valid_ = true;
 
-    TTEntry tt_entry;
-    const ZobristKey key = position.key();
-    if (tt_.probe(key, tt_entry) && tt_entry.bestMove != kNullMove) {
-      best_move = tt_entry.bestMove;
-    } else {
+    best_move = root_best_move_;
+    if (best_move == kNullMove) {
       MoveList moves;
       generateLegalMoves(position, moves);
       if (moves.size() > 0) {
         best_move = moves[0];
       }
     }
+    last_root_move_ = best_move;
 
     if (best_move != prev_best_move && depth > 1) {
       best_move_changes++;
@@ -1058,6 +1117,10 @@ Move Search::start(Position& position, const SearchLimits& limits) {
 }
 
 int Search::getScore(const Position& position) const {
+  if (position.key() == last_score_key_) {
+    return last_score_valid_ ? last_completed_score_ : 0;
+  }
+
   TTEntry tt_entry;
   const ZobristKey key = position.key();
   if (tt_.probe(key, tt_entry)) {
@@ -1069,18 +1132,24 @@ int Search::getScore(const Position& position) const {
 std::vector<Move> Search::getPV(const Position& position) const {
   std::vector<Move> pv;
   Position temp_pos = position;  // Work on a copy to avoid modifying original
+  const bool has_current_root =
+      last_score_valid_ && position.key() == last_score_key_;
   
   // Extract PV by recursively probing the transposition table
   // Follow the best moves stored in TT until we hit a position not in TT
   for (int depth = 0; depth < kMaxDepth; ++depth) {
-    TTEntry tt_entry;
-    const ZobristKey key = temp_pos.key();
-    
-    if (!tt_.probe(key, tt_entry)) {
-      break;  // No TT entry, end of PV
+    Move pv_move = kNullMove;
+    if (depth == 0 && has_current_root) {
+      pv_move = last_root_move_;
+    } else {
+      TTEntry tt_entry;
+      if (!tt_.probe(temp_pos.key(), tt_entry)) {
+        break;  // No TT entry, end of PV
+      }
+      pv_move = tt_entry.bestMove;
     }
-    
-    if (tt_entry.bestMove == kNullMove) {
+
+    if (pv_move == kNullMove) {
       break;  // No best move stored
     }
     
@@ -1090,7 +1159,7 @@ std::vector<Move> Search::getPV(const Position& position) const {
     
     bool move_legal = false;
     for (std::size_t i = 0; i < legal_moves.size(); ++i) {
-      if (legal_moves[i] == tt_entry.bestMove) {
+      if (legal_moves[i] == pv_move) {
         move_legal = true;
         break;
       }
@@ -1101,9 +1170,9 @@ std::vector<Move> Search::getPV(const Position& position) const {
     }
     
     // Add move to PV and make it to continue following the PV
-    pv.push_back(tt_entry.bestMove);
+    pv.push_back(pv_move);
     Undo undo;
-    doMove(temp_pos, tt_entry.bestMove, undo);
+    doMove(temp_pos, pv_move, undo);
   }
   
   return pv;

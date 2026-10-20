@@ -386,16 +386,31 @@ void initAttackTables(const Position& pos, EvalContext& ctx) {
     }
     ctx.attackedBy[ci][5] = kingAtt;
 
-    // Initialize attackedBy2 with pawn+king overlap
-    ctx.attackedBy2[ci] = pawnAtt & kingAtt;
-    ctx.attackedByAll[ci] = pawnAtt | kingAtt;
+    ctx.attackedBy2[ci] = 0;
+    ctx.attackedByAll[ci] = 0;
 
     // King ring (3x3 zone + forward rank)
     if (kingSq != Square::None) {
       ctx.kingRing[ci] = kingAtt | square_bb(kingSq);
     }
 
-    // Sliding/jumping pieces
+    const auto addAttacks = [&ctx, ci](Bitboard att) {
+      ctx.attackedBy2[ci] |= ctx.attackedByAll[ci] & att;
+      ctx.attackedByAll[ci] |= att;
+    };
+
+    // Add each piece's attacks separately so multiple pieces of the same type
+    // contribute to attackedBy2.
+    Bitboard pawnPieces = pawns;
+    while (pawnPieces) {
+      const Bitboard pawn = 1ULL << pop_lsb(pawnPieces);
+      const Bitboard att = c == Color::White
+                               ? shift_north_east(pawn) | shift_north_west(pawn)
+                               : shift_south_east(pawn) | shift_south_west(pawn);
+      addAttacks(att);
+    }
+    addAttacks(kingAtt);
+
     for (int pt = 1; pt <= 4; ++pt) {
       Bitboard pieces = pos.pieces(c, static_cast<PieceType>(pt));
       Bitboard ptAtt = 0;
@@ -409,10 +424,9 @@ void initAttackTables(const Position& pos, EvalContext& ctx) {
           case 4: att = magic::queenAttacks(sq, occ); break;
         }
         ptAtt |= att;
+        addAttacks(att);
       }
       ctx.attackedBy[ci][pt] = ptAtt;
-      ctx.attackedBy2[ci] |= ctx.attackedByAll[ci] & ptAtt;
-      ctx.attackedByAll[ci] |= ptAtt;
     }
   }
 }

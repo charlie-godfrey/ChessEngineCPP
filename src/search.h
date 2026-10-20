@@ -55,7 +55,10 @@ class Search {
   void stop() { stop_search_ = true; }
   bool stopped() const { return stop_search_.load(); }
   void resizeTT(std::size_t mb) { tt_.resize(mb); }
-  void clearTT() { tt_.clear(); }
+  void clearTT() {
+    tt_.clear();
+    last_score_valid_ = false;
+  }
 
  private:
   static constexpr int kMaxDepth = 64;
@@ -82,6 +85,11 @@ class Search {
   TranspositionTable tt_;
   int contempt_factor_ = 0;
   std::uint64_t nodes_searched_ = 0;
+  ZobristKey last_score_key_ = 0;
+  int last_completed_score_ = 0;
+  Move root_best_move_ = kNullMove;
+  Move last_root_move_ = kNullMove;
+  bool last_score_valid_ = false;
 
   SearchParams params_{};
   std::uint64_t max_nodes_ = 0;
@@ -94,7 +102,8 @@ class Search {
 
   int negamax(Position& position, int depth, int alpha, int beta, int ply,
               std::vector<ZobristKey>& position_history, Move prev_move = kNullMove);
-  int quiescence(Position& position, int alpha, int beta, int qdepth = 0);
+  int quiescence(Position& position, int alpha, int beta, int qdepth,
+                 std::vector<ZobristKey>& position_history, int ply);
   bool isLegal(Position& position, Move move);
   int getMvvLvaScore(Move move) const;
   int see(const Position& position, Square from, Square to) const;

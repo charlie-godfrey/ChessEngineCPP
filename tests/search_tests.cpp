@@ -8,6 +8,7 @@
 
 #include <cassert>
 #include <iostream>
+#include <vector>
 
 namespace {
 
@@ -36,7 +37,8 @@ void test_transposition_table_basic() {
   
   // Different key should not be found
   aurora::Position pos2;
-  pos2.set_startpos();
+  assert(pos2.setFromFEN(
+      "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"));
   const aurora::ZobristKey key2 = pos2.key();
   assert(!tt.probe(key2, entry));  // Should not find different position
   
@@ -59,6 +61,14 @@ void test_transposition_table_replace() {
   
   // Probe should return second entry
   aurora::TTEntry entry;
+  assert(tt.probe(key, entry));
+  assert(entry.bestMove == move2);
+  assert(entry.score == 200);
+  assert(entry.depth == 5);
+  assert(entry.bound == aurora::BoundType::Lower);
+
+  // A qsearch result must not replace a deeper main-search result.
+  tt.store(key, aurora::kNullMove, -50, -1, aurora::BoundType::Upper);
   assert(tt.probe(key, entry));
   assert(entry.bestMove == move2);
   assert(entry.score == 200);
@@ -112,7 +122,8 @@ void test_search_basic() {
     }
   }
   assert(found || legal_moves.size() == 0);  // Move should be legal (or no moves)
-  
+  assert(search.nodesSearched() > legal_moves.size());
+
   std::cout << "[OK] Basic search returns legal move\n";
 }
 
@@ -246,6 +257,64 @@ void test_search_same_position_different_depths() {
   std::cout << "[OK] TT reuse across depths\n";
 }
 
+void test_reported_score_uses_latest_completed_search() {
+  aurora::Position position;
+  aurora::Search search;
+
+  assert(search.start(position, 12) != aurora::kNullMove);
+
+  int latest_score = 0;
+  int latest_depth = 0;
+  aurora::SearchLimits limits;
+  limits.max_depth = 10;
+  limits.on_depth = [&](const aurora::SearchInfo& info) {
+    latest_score = info.score;
+    latest_depth = info.depth;
+  };
+
+  assert(search.start(position, limits) != aurora::kNullMove);
+  assert(latest_depth == limits.max_depth);
+  assert(search.getScore(position) == latest_score);
+
+  std::cout << "[OK] Reported score is from latest completed search\n";
+}
+
+void test_root_move_uses_latest_search_not_stale_tt() {
+  aurora::Position start_position;
+  aurora::Search reused_search;
+  assert(reused_search.start(start_position, 12) != aurora::kNullMove);
+
+  aurora::MoveList legal_moves;
+  aurora::generateLegalMoves(start_position, legal_moves);
+  aurora::Move d4 = aurora::kNullMove;
+  for (std::size_t i = 0; i < legal_moves.size(); ++i) {
+    if (aurora::toUci(legal_moves[i]) == "d2d4") {
+      d4 = legal_moves[i];
+      break;
+    }
+  }
+  assert(d4 != aurora::kNullMove);
+
+  aurora::Undo undo;
+  aurora::doMove(start_position, d4, undo);
+
+  aurora::SearchInfo latest_info;
+  aurora::SearchLimits limits;
+  limits.max_depth = 10;
+  limits.on_depth = [&](const aurora::SearchInfo& info) {
+    latest_info = info;
+  };
+  const aurora::Move reused_move = reused_search.start(start_position, limits);
+  assert(latest_info.depth == limits.max_depth);
+  assert(reused_move == latest_info.best_move);
+  assert(reused_search.getScore(start_position) == latest_info.score);
+  const std::vector<aurora::Move> pv = reused_search.getPV(start_position);
+  assert(!pv.empty());
+  assert(pv.front() == reused_move);
+
+  std::cout << "[OK] Root move uses latest search, not stale TT entry\n";
+}
+
 void test_search_move_quality() {
   // Test that search finds reasonable moves from startpos
   aurora::Position position;
@@ -298,6 +367,38 @@ void test_search_quiescence() {
   std::cout << "[OK] Quiescence search\n";
 }
 
+void test_search_repetition_history() {
+  aurora::Position position;
+  position.set_startpos();
+  const aurora::ZobristKey key = position.key();
+
+  // The final key is the current position; it must not be counted twice.
+  std::vector<aurora::ZobristKey> repeated_history{key, key};
+  aurora::Search root_search;
+  aurora::SearchLimits root_limits;
+  root_limits.max_depth = 1;
+  root_limits.game_history = &repeated_history;
+  assert(root_search.start(position, root_limits) != aurora::kNullMove);
+  assert(!root_search.getPV(position).empty());
+
+  // A history containing only the current position should behave exactly like
+  // no supplied history, including during the same-node IID search.
+  std::vector<aurora::ZobristKey> current_only_history{key};
+  aurora::Search no_history_search;
+  aurora::Search current_history_search;
+  const aurora::Move no_history_move = no_history_search.start(position, 6);
+  aurora::SearchLimits current_history_limits;
+  current_history_limits.max_depth = 6;
+  current_history_limits.game_history = &current_only_history;
+  const aurora::Move current_history_move =
+      current_history_search.start(position, current_history_limits);
+  assert(current_history_move == no_history_move);
+  assert(current_history_search.nodesSearched() ==
+         no_history_search.nodesSearched());
+
+  std::cout << "[OK] Repetition history and IID\n";
+}
+
 }  // namespace
 
 int main() {
@@ -313,8 +414,11 @@ int main() {
   test_search_stalemate();
   test_search_iterative_deepening();
   test_search_same_position_different_depths();
+  test_reported_score_uses_latest_completed_search();
+  test_root_move_uses_latest_search_not_stale_tt();
   test_search_move_quality();
   test_search_quiescence();
+  test_search_repetition_history();
   
   std::cout << "\nAll search tests passed!\n";
   return 0;
